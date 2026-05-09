@@ -16,24 +16,17 @@ on:
           - mp3 (audio only)
         default: 'mp4 (video)'
       desired_quality:
-        description: 'Quality (video: 144p|360p|480p|720p|1080p  |  audio: 64kbps|128kbps|192kbps|320kbps)'
+        description: 'Quality (video: 720p, 1080p | audio: 192kbps, 320kbps)'
         required: false
         type: string
         default: '720p'
-      youtube_cookies:
-        description: |
-          (اختیاری) محتوای فایل cookies.txt از مرورگر شما
-          راهنما: https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies
-        required: false
-        type: string
-        default: ''
       max_part_mb:
-        description: 'Max split size in MB (0 = auto 95MB)'
+        description: 'Maximum part size in MB (0 = auto split at 95MB)'
         required: false
         type: string
         default: '95'
       output_folder:
-        description: 'Destination folder inside the repo'
+        description: 'Destination folder'
         required: false
         type: string
         default: 'downloads'
@@ -42,213 +35,148 @@ permissions:
   contents: write
 
 jobs:
-  download:
+  fetch-and-store:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 25
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install dependencies
+      - name: Install tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y zip curl python3 python3-pip ffmpeg
-          # Always use latest yt-dlp (bot detection fixes ship frequently)
-          pip3 install --quiet --upgrade yt-dlp
+          sudo apt-get install -y zip curl python3
 
-      # ── Write cookies file if provided ──────────────────────────────────
-      - name: Prepare cookies
-        id: cookies
+      - name: Retrieve download link
+        id: retrieve
         run: |
-          COOKIE_ARG=""
-          COOKIES="${{ github.event.inputs.youtube_cookies }}"
-          if [ -n "$COOKIES" ]; then
-            echo "$COOKIES" > /tmp/yt_cookies.txt
-            COOKIE_ARG="--cookies /tmp/yt_cookies.txt"
-            echo "✅  Cookies loaded"
-          else
-            echo "ℹ️  No cookies provided — will try without"
-          fi
-          echo "cookie_arg=$COOKIE_ARG" >> $GITHUB_OUTPUT
+          python3 << 'EOF'
+          import os, sys, time, re, requests, json
 
-      # ── Validate inputs ─────────────────────────────────────────────────
-      - name: Validate inputs
-        id: validate
-        run: |
-          python3 << 'PYEOF'
-          import os, sys, re
+          URL = os.environ.get('INPUT_URL')
+          FMT = os.environ.get('INPUT_FORMAT')
+          QUAL = os.environ.get('INPUT_QUALITY')
+          OUT_DIR = os.environ.get('INPUT_FOLDER')
 
-          url    = os.environ.get('INPUT_URL', '').strip().strip('*_ \t')
-          fmt    = os.environ.get('INPUT_FORMAT', 'mp4').strip()
-          qual   = os.environ.get('INPUT_QUALITY', '').strip()
-          folder = os.environ.get('INPUT_FOLDER', 'downloads').strip()
+          # Normalize
+          is_audio = FMT == 'mp3'
+          if is_audio:
+              QUAL = QUAL if QUAL in ('64kbps','128kbps','192kbps','320kbps') else '192kbps'
+          else:
+              QUAL = QUAL if QUAL in ('720p','1080p') else '720p'
 
-          if not re.match(r'https?://(www\.)?(youtube\.com|youtu\.be)/\S+', url, re.I):
-              print(f"::error::Invalid YouTube URL: '{url}'")
+          payload = {
+              "url": URL,
+              "os": "linux",
+              "output": {
+                  "type": "audio" if is_audio else "video",
+                  "format": FMT
+              }
+          }
+          if is_audio:
+              payload["audio"] = {"bitrate": QUAL}
+          else:
+              payload["output"]["quality"] = QUAL
+
+          s = requests.Session()
+          s.headers.update({"User-Agent": "Mozilla/5.0", "Content-Type": "application/json"})
+          s.get("https://media.ytmp3.gg/")
+
+          resp = s.post("https://hub.ytconvert.org/api/download", json=payload, timeout=30)
+          resp.raise_for_status()
+          data = resp.json()
+
+          status_url = data.get('statusUrl')
+          title = data.get('title', 'video')
+
+          dl_url = None
+          for _ in range(120):          # increased timeout
+              time.sleep(2)
+              r = s.get(status_url, timeout=20)
+              status = r.json()
+              if status.get('status') == 'completed':
+                  dl_url = status.get('downloadUrl')
+                  break
+              if status.get('status') == 'failed':
+                  print("::error::Server failed to process video")
+                  sys.exit(1)
+
+          if not dl_url:
+              print("::error::Timeout - could not get download link")
               sys.exit(1)
 
-          valid_video = ('144p','360p','480p','720p','1080p','1440p','2160p')
-          valid_audio = ('64kbps','128kbps','192kbps','320kbps')
-          if fmt == 'mp3':
-              qual = qual if qual in valid_audio else '192kbps'
-          else:
-              qual = qual if qual in valid_video else '720p'
+          # Safe filename
+          vid = re.search(r'(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})', URL) or [None, 'unknown']
+          vid = vid[1]
+          clean = re.sub(r'[^a-zA-Z0-9\-_()\[\]]', '_', title.replace(' ', '_'))
+          clean = re.sub(r'_+', '_', clean).strip('_')[:80] or vid
+          fname = f"{clean}_{vid}_{QUAL}.{FMT}"
 
-          folder = re.sub(r'[^a-zA-Z0-9_\-/]', '_', folder).strip('/') or 'downloads'
+          os.makedirs(OUT_DIR, exist_ok=True)
+          with open(f"{OUT_DIR}/.download_info", "w", encoding="utf-8") as f:
+              f.write(f"{dl_url}\n{fname}\n{FMT}\n{QUAL}")
 
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as fh:
-              fh.write(f"url={url}\nfmt={fmt}\nquality={qual}\nfolder={folder}\n")
-
-          print(f"✅  URL={url}  FMT={fmt}  QUAL={qual}  FOLDER={folder}")
-          PYEOF
+          print(f"Ready: {fname}")
+          EOF
         env:
-          INPUT_URL:     ${{ github.event.inputs.video_url }}
-          INPUT_FORMAT:  ${{ github.event.inputs.output_format == 'mp3 (audio only)' && 'mp3' || 'mp4' }}
+          INPUT_URL: ${{ github.event.inputs.video_url }}
+          INPUT_FORMAT: ${{ github.event.inputs.output_format == 'mp3 (audio only)' && 'mp3' || 'mp4' }}
           INPUT_QUALITY: ${{ github.event.inputs.desired_quality }}
-          INPUT_FOLDER:  ${{ github.event.inputs.output_folder }}
+          INPUT_FOLDER: ${{ github.event.inputs.output_folder }}
 
-      # ── Download ─────────────────────────────────────────────────────────
-      - name: Download with yt-dlp
-        id: download
+      - name: Download file
         run: |
-          python3 << 'PYEOF'
-          import os, sys, subprocess, shutil
+          FOLDER="${{ github.event.inputs.output_folder }}"
+          INFO="$FOLDER/.download_info"
+          DL_URL=$(head -1 "$INFO")
+          FNAME=$(sed -n '2p' "$INFO")
 
-          url     = "${{ steps.validate.outputs.url }}"
-          fmt     = "${{ steps.validate.outputs.fmt }}"
-          quality = "${{ steps.validate.outputs.quality }}"
-          folder  = "${{ steps.validate.outputs.folder }}"
-          cookies = "${{ steps.cookies.outputs.cookie_arg }}"  # e.g. "--cookies /tmp/yt_cookies.txt"
-          tmp_dir = os.path.join(folder, ".tmp_dl")
-          os.makedirs(tmp_dir, exist_ok=True)
+          mkdir -p "$FOLDER/parts"
+          echo "Downloading $FNAME ..."
+          curl -L --fail -o "$FOLDER/parts/$FNAME" "$DL_URL"
 
-          out_tmpl = os.path.join(tmp_dir, "%(title).80s [%(id)s].%(ext)s")
-
-          # Cookie flags (split into list if present)
-          cookie_flags = cookies.split() if cookies.strip() else []
-
-          # ── Clients to try in order (each bypasses bot-check differently) ──
-          # tv_embedded  → no sign-in required, no bot check
-          # mweb         → mobile web client, less restricted
-          # web          → standard (needs cookies on shared IPs)
-          CLIENTS = ["tv_embedded", "mweb", "ios", "android"]
-
-          def build_cmd(client, fmt_sel, extra_flags=None):
-              cmd = [
-                  "yt-dlp",
-                  "--no-playlist",
-                  "--extractor-args", f"youtube:player_client={client}",
-                  "--restrict-filenames",
-                  "--no-warnings",
-                  "--progress",
-                  "-o", out_tmpl,
-              ] + cookie_flags + (extra_flags or [])
-
-              if fmt == "mp3":
-                  bitrate = quality.replace("kbps", "")
-                  cmd += ["-x", "--audio-format", "mp3", "--audio-quality", bitrate]
-              else:
-                  cmd += ["-f", fmt_sel, "--merge-output-format", "mp4"]
-
-              cmd.append(url)
-              return cmd
-
-          height = quality.rstrip("p")
-          fmt_sel = "/".join([
-              f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]",
-              f"bestvideo[height<={height}]+bestaudio",
-              f"best[height<={height}]",
-              "bestvideo+bestaudio",
-              "best",
-          ])
-
-          success = False
-          for client in CLIENTS:
-              print(f"\n▶  Trying client: [{client}]")
-              result = subprocess.run(build_cmd(client, fmt_sel))
-              if result.returncode == 0:
-                  # Check a file actually appeared
-                  files = [f for f in os.listdir(tmp_dir) if os.path.isfile(os.path.join(tmp_dir, f))]
-                  if files:
-                      success = True
-                      print(f"✅  Success with client [{client}]")
-                      break
-              print(f"⚠️   Client [{client}] failed — trying next …")
-
-          if not success:
-              print("\n::error::All clients failed.")
-              print("::error::Possible reasons:")
-              print("::error::  1. Video is age-restricted or private → provide cookies")
-              print("::error::  2. Video is unavailable in GitHub's region")
-              print("::error::  3. YouTube changed their API — update yt-dlp")
-              sys.exit(1)
-
-          files = [f for f in os.listdir(tmp_dir) if os.path.isfile(os.path.join(tmp_dir, f))]
-          downloaded = files[0]
-          size_mb = os.path.getsize(os.path.join(tmp_dir, downloaded)) / (1024 * 1024)
-
-          print(f"\n✅  File : {downloaded}")
-          print(f"✅  Size : {size_mb:.1f} MB")
-
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as fh:
-              fh.write(f"filename={downloaded}\ntmp_dir={tmp_dir}\nsize_mb={size_mb:.1f}\n")
-          PYEOF
-
-      # ── Split or move ────────────────────────────────────────────────────
-      - name: Split or move file
-        run: |
-          python3 << 'PYEOF'
-          import os, subprocess, shutil
-
-          folder   = "${{ steps.validate.outputs.folder }}"
-          tmp_dir  = "${{ steps.download.outputs.tmp_dir }}"
-          filename = "${{ steps.download.outputs.filename }}"
-          size_mb  = float("${{ steps.download.outputs.size_mb }}")
-
-          try:
-              thresh = int(float("${{ github.event.inputs.max_part_mb }}".strip()))
-          except (ValueError, TypeError):
-              thresh = 0
-          if thresh <= 0 or thresh > 95:
-              thresh = 95
-
-          src = os.path.join(tmp_dir, filename)
-
-          if size_mb > thresh:
-              print(f"📦  {size_mb:.1f} MB > {thresh} MB → splitting")
-              zip_base = os.path.join(folder, filename + ".zip")
-              subprocess.run(["zip", "-r", "-s", f"{thresh}m", zip_base, "--", src], check=True)
-              parts = sorted([
-                  f for f in os.listdir(folder)
-                  if f.startswith(filename + ".z") or f == filename + ".zip"
-              ])
-              print(f"✅  {len(parts)} part(s) created")
-              with open(os.path.join(folder, f"HOW_TO_JOIN_{filename}.txt"), "w") as fh:
-                  fh.write(
-                      f"Download ALL parts:\n" + "\n".join(f"  {p}" for p in parts) +
-                      "\n\nLinux/macOS:\n  zip -FF " + filename + ".zip --out full.zip && unzip full.zip" +
-                      "\n\nWindows:\n  Open .zip with 7-Zip\n"
-                  )
-          else:
-              print(f"📁  {size_mb:.1f} MB ≤ {thresh} MB → moving directly")
-              shutil.move(src, os.path.join(folder, filename))
-
-          shutil.rmtree(tmp_dir, ignore_errors=True)
-          PYEOF
-
-      # ── Commit & push ────────────────────────────────────────────────────
-      - name: Commit and push
-        run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add "${{ steps.validate.outputs.folder }}/"
-          if git diff --cached --quiet; then
-            echo "Nothing to commit."
-          else
-            git commit -m "⬇️ YT ${{ steps.validate.outputs.fmt }} – ${{ steps.download.outputs.filename }} (${{ steps.download.outputs.size_mb }} MB, ${{ steps.validate.outputs.quality }}) [skip ci]"
-            git push
-            echo "✅  Pushed to ${{ steps.validate.outputs.folder }}/"
+          if [ ! -s "$FOLDER/parts/$FNAME" ]; then
+            echo "Error: Downloaded file is empty!"
+            exit 1
           fi
+
+      - name: Split large files
+        run: |
+          FOLDER="${{ github.event.inputs.output_folder }}"
+          THRESH_MB=${{ github.event.inputs.max_part_mb }}
+          if [ "$THRESH_MB" -le 0 ] || [ "$THRESH_MB" -gt 95 ]; then
+            THRESH_MB=95
+          fi
+          THRESH=$((THRESH_MB * 1024 * 1024))
+
+          cd "$FOLDER/parts"
+
+          for f in *; do
+            if [ -f "$f" ]; then
+              size=$(stat -c%s -- "$f")
+              echo "File size: $((size / 1024 / 1024)) MB"
+
+              if [ "$size" -gt "$THRESH" ]; then
+                echo "Splitting $f into ${THRESH_MB}MB parts..."
+                zip -r -s "${THRESH_MB}m" "../${f}.zip" -- "$f"
+                rm -- "$f"
+              else
+                mv -- "$f" ..
+              fi
+            fi
+          done
+
+          cd ../..
+          rm -rf "$FOLDER/parts" "$FOLDER/.download_info"
+        shell: bash
+
+      - name: Commit & Push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "${{ github.event.inputs.output_folder }}/"
+          git commit -m "⬇️ YouTube download [skip ci]" || echo "No changes"
+          git push
